@@ -1,0 +1,520 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{bm}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{booktabs}
+
+\title{Dynamical Model for CYGNSS Passive Formation Optimization:\\
+Detailed Explanation and Design Rationale}
+\author{CYGNSS Relative-Dynamics Validation}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This document is a standalone, implementation-level explanation of the dynamical models used in the CYGNSS formation-optimization workflow. It complements \texttt{ch-problem.tex} by recording \emph{why} each modeling choice was made, what alternatives were considered and rejected, and how the pieces fit together from onboard ephemerides through averaged relative orbital element (ROE) propagation to Orekit high-fidelity validation. Nothing here changes the production code or validation settings; it is documentation only.
+\end{abstract}
+
+\tableofcontents
+
+%=============================================================================
+\section{Architectural overview}
+%=============================================================================
+
+The workflow deliberately uses \textbf{two propagation tiers} with different fidelity and cost:
+
+\begin{enumerate}[label=\textbf{\arabic*.}]
+    \item \textbf{Inner loop (optimization):} Gauss-averaged $J_2$ secular relative orbital elements (ROEs). Thousands of candidate formations must be scored quickly. Short-period gravity, drag, solar radiation pressure (SRP), and third-body effects are omitted on purpose.
+    \item \textbf{Outer loop (validation):} Orekit Cowell numerical integration with a $20\times20$ geopotential, NRLMSISE-00 drag, isotropic SRP, and Sun/Moon third-body gravity. This restores osculating motion and non-$J_2$ physics for the winning configurations and for comparison against flight data.
+\end{enumerate}
+
+\textbf{Decision rationale.} Optimization without averaging would require either very small time steps (prohibitively expensive) or would inject short-period ripple into cost metrics that the optimizer is not meant to control. Averaged ROEs capture the dominant \emph{secular} drift that determines whether two CYGNSS spacecraft remain passively close over days. Orekit then answers: ``once short-period and non-gravitational effects return, is the formation still acceptable?''
+
+Repository locations:
+\begin{itemize}
+    \item ROE core: \texttt{Optimizer/j2\_roe\_core.py}
+    \item ROE integrator: \texttt{Optimizer/relative\_dynamics\_j2.py}
+    \item Orekit propagator: \texttt{Optimizer/propagator\_orekit/}
+    \item Flight validation: \texttt{Optimizer/Propagator Validation/}
+\end{itemize}
+
+%=============================================================================
+\section{Why not Clohessy--Wiltshire (CW) equations?}
+%=============================================================================
+
+CW (or Hill) linearized relative motion assumes the deputy remains close to the chief in a locally inertial frame tied to the chief's \emph{circular} reference orbit. For CYGNSS passive formation at separations of tens to hundreds of kilometers:
+
+\begin{itemize}
+    \item Secular $J_2$ effects (nodal regression, argument-of-perigee rotation, differential mean motion from $\delta a$) dominate the long-term geometry.
+    \item The deputy is \emph{not} guaranteed to stay in the CW-valid regime ($\ll 1$~km for meter-level accuracy) without active control.
+    \item CW does not parameterize formation design in element space, which is how mission constraints (relative eccentricity/inclination vectors, along-track drift budget) are naturally expressed.
+\end{itemize}
+
+\textbf{Decision:} Use Gauss-averaged ROE propagation for the inner loop. CW remains useful only as a \emph{visualization frame} (radial--along-track--cross-track, RTN) for plotting relative position, not as the propagator.
+
+%=============================================================================
+\section{State representation: relative orbital elements}
+%=============================================================================
+
+\subsection{Definition}
+
+Classical chief elements are $\bm{\alpha}_c = [a_c, e_c, i_c, \Omega_c, \omega_c, M_c]$. The ROE vector is
+\begin{equation}
+\delta\bm{\alpha} =
+\begin{bmatrix}
+\delta a \\ \delta\lambda \\ \delta e_x \\ \delta e_y \\ \delta i_x \\ \delta i_y
+\end{bmatrix}
+=
+\begin{bmatrix}
+a_d/a_c - 1 \\
+(u_d - u_c) + (\Omega_d-\Omega_c)\cos i_c \\
+e_d\cos\omega_d - e_c\cos\omega_c \\
+e_d\sin\omega_d - e_c\sin\omega_c \\
+i_d - i_c \\
+(\Omega_d - \Omega_c)\sin i_c
+\end{bmatrix},
+\label{eq:roes}
+\end{equation}
+where $u = \omega + M$ is the \textbf{mean} argument of latitude in propagation, and $u = \omega + \nu$ when forming ROEs from \textbf{osculating} onboard samples at a fixed epoch.
+
+\textbf{Decision: quasi-nonsingular relative elements} ($\delta e_x,\delta e_y$ and $\delta i_x,\delta i_y$) rather than differences in $(e,\omega)$ and $(i,\Omega)$ directly.
+
+\textbf{Rationale:}
+\begin{itemize}
+    \item Avoids the circular-orbit singularity in $(e,\omega)$.
+    \item Relative eccentricity and inclination \emph{vectors} rotate under $J_2$ secular $\dot\omega$ and $\dot\Omega$ in a physically transparent way.
+    \item Matches the D'Amico / Di Mauro formation-flying literature used in the thesis chapter.
+\end{itemize}
+
+\textbf{Known limitation:} Equatorial chief orbits ($i_c \to 0$) still singular in $\delta i_y = (\Omega_d-\Omega_c)\sin i_c$. CYGNSS at $i \approx 35^\circ$ is far from this singularity.
+
+\subsection{What each component means geometrically}
+
+\begin{itemize}
+    \item $\delta a$: fractional semimajor-axis difference. Drives Keplerian differential mean motion and thus long along-track drift.
+    \item $\delta\lambda$: relative mean longitude (along-track phasing in the averaged picture).
+    \item $(\delta e_x,\delta e_y)$: relative eccentricity vector; sets radial and along-track oscillation amplitudes and their phase on the chief orbit.
+    \item $(\delta i_x,\delta i_y)$: relative inclination vector; sets cross-track oscillation amplitude and phase.
+\end{itemize}
+
+At CYGNSS separations ($\sim 100$~km, $\delta a \sim 10^{-4}$), these interpretations are first-order accurate; higher-order coupling appears at larger separations.
+
+%=============================================================================
+\section{Propagation model: $J_2$ secular ROE equations}
+%=============================================================================
+
+\subsection{Chief and deputy classical $J_2$ secular rates}
+
+Earth oblateness ($J_2$) induces the standard Gauss-averaged secular rates (Brouwer first-order), written compactly as in \texttt{ch-problem.tex}:
+\begin{equation}
+\dot{\bm{\alpha}}_{J_2} \propto
+\begin{bmatrix} 0 \\ 0 \\ 0 \\ 5\cos^2 i - 1 \\ -2\cos i \\ 3\eta\cos^2 i \end{bmatrix},
+\qquad \eta = \sqrt{1-e^2},\quad n = \sqrt{\mu/a^3}.
+\end{equation}
+
+Only $\dot\omega$, $\dot\Omega$, and $\dot M$ are nonzero at this order; $a$, $e$, and $i$ are secularly constant in the averaged $J_2$ model.
+
+\subsection{ROE time derivatives}
+
+Differentiating \eqref{eq:roes} and substituting chief/deputy $J_2$ secular rates yields the propagation right-hand side implemented in \texttt{relative\_dynamics\_j2.py}. Symbolically (matching equation (EOMs) in \texttt{ch-problem.tex}):
+\begin{equation}
+\delta\dot{\bm{\alpha}} =
+\begin{bmatrix}
+0 \\
+(\eta_d P_d K_d - \eta_c P_c K_c) + (K_d Q_d - K_c Q_c)\cos i_c \\
+-e_d Q_d \sin\omega_d + e_c Q_c \sin\omega_c \\
+e_d Q_d \cos\omega_d - e_c Q_c \cos\omega_c \\
+0 \\
+-2(K_d\cos i_d - K_c\cos i_c)\sin i_c
+\end{bmatrix},
+\end{equation}
+with $Q = 5\cos^2 i - 1$, $P = 3\cos^2 i$, and $K = \tfrac{3}{4} n J_2 R_E^2 / (a^2 \eta^4)$.
+
+\textbf{Implementation detail:} The RHS evaluates $K$, $Q$, $P$ using the \emph{instantaneous} deputy $(a_d,e_d,i_d,\omega_d)$ reconstructed from the current $\delta\bm{\alpha}$ and chief, not frozen epoch values. This keeps $\delta\dot\lambda$ consistent as $(e,\omega)$ evolve secularly.
+
+\subsection{Chief propagation}
+
+The chief advances in \textbf{mean} classical elements under the same $J_2$ secular model (\texttt{chief\_secular\_at\_time}). Mean anomaly uses Keplerian $\dot M = n$ unless a J2-modified rate mode is selected (default: \texttt{kepler}).
+
+\subsection{Deputy reconstruction}
+
+At each time, the deputy is recovered algebraically from chief + ROEs (\texttt{reconstruct\_deputy\_from\_relative}):
+\begin{align}
+a_d &= a_c(1+\delta a), &
+i_d &= i_c + \delta i_x, &
+\Omega_d &= \Omega_c + \delta i_y/\sin i_c, \\
+e_{x,d} &= e_{x,c}+\delta e_x, &
+e_{y,d} &= e_{y,c}+\delta e_y, &
+M_d &= M_c + \delta\lambda - (\omega_d-\omega_c) - (\Omega_d-\Omega_c)\cos i_c.
+\end{align}
+
+\textbf{Decision:} Propagate $\delta\bm{\alpha}$, not full deputy elements, as the dynamical state.
+
+\textbf{Rationale:} The ROE equations are derived precisely for this composite state; relative rates are lower-dimensional and directly enter the cost function. Reconstruction is $O(1)$ algebra at each output time.
+
+%=============================================================================
+\section{Critical decision: no Keplerian $\delta a$ term in $\delta\dot\lambda$}
+%=============================================================================
+
+For two Keplerian orbits with $\delta a \neq 0$, the along-track separation grows as $-\tfrac{3}{2} a_c \,\delta a\,\Delta u$ where $\Delta u$ is elapsed argument of latitude. This effect is \textbf{geometric}, not part of the $J_2$ secular rate of mean longitude difference.
+
+The first-order ROE-to-position map (Section~\ref{sec:mapping}) includes
+\begin{equation}
+\delta r_t/a_c \supset -\tfrac{3}{2}\delta a\,\Delta u.
+\end{equation}
+
+\textbf{Decision:} $\delta\dot\lambda$ contains \emph{only} the $J_2$ secular difference from the Gauss equations. The term $(n_d - n_c) \approx -\tfrac{3}{2} n_c \delta a$ is \textbf{not} added to $\delta\dot\lambda$.
+
+\textbf{Rationale:} Adding $(n_d-n_c)$ to $\delta\dot\lambda$ \emph{while also} using the $-\tfrac{3}{2}\delta a\,\Delta u$ term in the position map \textbf{double-counts} along-track drift. Validation before this fix showed gross along-track errors; after removal, CYG02/CYG07 along-track drift over $\sim 4$~h matched onboard to within $\sim 10$~km.
+
+\textbf{Practical rule:}
+\begin{itemize}
+    \item \textbf{Propagation:} $\delta\dot\lambda$ = $J_2$ secular only.
+    \item \textbf{Geometry:} along-track secular drift from $\delta a$ enters only through $\Delta u$ in the mapping.
+\end{itemize}
+
+%=============================================================================
+\section{Mean elements versus osculating elements}
+%=============================================================================
+
+\subsection{The distinction}
+
+\begin{itemize}
+    \item \textbf{Osculating elements} are the instantaneous Keplerian fit to position and velocity at time $t$. They include all short-period effects from $J_2$ and higher harmonics.
+    \item \textbf{Mean elements} (in this project: \textbf{mean-line} elements) are the slowly varying part the ROE integrator is meant to follow---the secular $J_2$ trajectory with short-period ripple removed.
+\end{itemize}
+
+Onboard CYGNSS L1 ephemerides report osculating-classical quantities at 5-minute cadence. The ROE integrator must not be initialized from raw osculating elements without preprocessing, or its state would not match the theory underlying \eqref{eq:roes} and the secular EOMs.
+
+\subsection{Why Kozai inversion for semimajor axis}
+
+Orbit-averaging over one revolution suppresses most short-period variation in $e$, $i$, $\Omega$, $\omega$, but semimajor axis retains a first-order $J_2$ short-period component. Kozai's relation gives, to first order,
+\begin{equation}
+a_\mathrm{osc} = \bar{a} + \frac{J_2 R_E^2}{\bar{a}}\,g(\nu),
+\qquad
+g(\nu) =
+\left(\frac{1+e\cos\nu}{1-e^2}\right)^{\!3}
+\bigl[1 - 3\sin^2 i\,\sin^2(\omega+\nu)\bigr].
+\label{eq:kozai}
+\end{equation}
+
+\textbf{Decision:} After orbit-averaging osculating samples, solve \eqref{eq:kozai} for mean $\bar{a}$ at the epoch true anomaly (\texttt{osculating\_kepler\_to\_mean\_line}). Retain averaged $e$, $i$, $\Omega$, $\omega$; set $M$ from epoch $\nu$.
+
+\textbf{Rationale:}
+\begin{itemize}
+    \item ROE theory assumes mean elements as the chief/deputy backbone.
+    \item Without Kozai inversion, mean $a$ sits on the wrong level, biasing $\delta a$ and the $-\tfrac{3}{2}\delta a\,\Delta u$ drift term.
+    \item At CYGNSS $i \approx 35^\circ$, $g(\nu)$ is always $\geq 0$ near the critical inclination $35.26^\circ$, so mean SMA sits near the \emph{trough} of the osculating $a$ envelope rather than its center. This is expected physics, not a bug.
+\end{itemize}
+
+\textbf{Relative drift preserved:} Both spacecraft receive identical treatment, so $\delta a$ from mean lines tracks the differential semimajor axis relevant to secular along-track drift even when absolute mean $a$ is offset from the osculating mean.
+
+%=============================================================================
+\section{Mean-line initial condition extraction}
+%=============================================================================
+
+Function \texttt{\_mean\_elements\_at\_epoch} in the validation scripts implements the production recipe:
+
+\begin{enumerate}
+    \item Load onboard osculating COE history in the validation window; epoch is the first common sample.
+    \item Estimate orbital period from epoch $a_\mathrm{osc}$.
+    \item Define averaging window: \textbf{one complete forward orbit} from epoch, $[t_0,\, t_0 + T]$, using available samples at 5-minute cadence.
+    \item Compute arithmetic means of $a$, $e$, $i$, $\Omega$, $\omega$ (with unwrap on angles).
+    \item Apply Kozai inversion at epoch $\nu(t_0)$ to obtain mean-line \texttt{ClassicalElements}.
+\end{enumerate}
+
+\subsection{Why one forward orbit (not centered 1.5 or 2.0 orbits)?}
+
+\textbf{Decision:} $n_\mathrm{orbit} = 1.0$ forward from epoch only.
+
+\textbf{Rationale:}
+\begin{itemize}
+    \item Ephemeris data begin at the window epoch; no samples exist for a pre-epoch half-orbit.
+    \item A ``centered'' window that implicitly assumes symmetric coverage before epoch would clip the wrong arc and bias the mean.
+    \item One full revolution is the minimum span that averages the dominant short-period terms once; experiments with longer windows did not materially change validation metrics for CYG02/CYG07.
+\end{itemize}
+
+%=============================================================================
+\section{Relative initial conditions and the $\delta\lambda_0$ anchor}
+%=============================================================================
+
+Given mean-line chief $\bar{\bm{\alpha}}_c$ and deputy $\bar{\bm{\alpha}}_d$ at epoch:
+\begin{equation}
+\delta\bm{\alpha}_0 = \text{inverse\_delta\_alpha\_from\_deputy}(\bar{\bm{\alpha}}_c, \bar{\bm{\alpha}}_d),
+\end{equation}
+using mean arguments of latitude ($u = \omega + M$).
+
+\subsection{The $\delta\lambda_0$ exception}
+
+\textbf{Decision:} Replace $\delta\lambda_0$ with the \textbf{osculating} onboard value at epoch:
+\begin{verbatim}
+delta0 = inverse_delta_alpha_from_deputy(chief_mean, dep_mean)
+delta0[1] = rel_on[0, 1]   # osculating delta_lambda at epoch
+\end{verbatim}
+
+All other components of $\delta\bm{\alpha}_0$ remain from mean-line elements.
+
+\textbf{Rationale:}
+\begin{itemize}
+    \item Mean-line extraction and Kozai inversion align $a$, $e$, $i$, and the relative eccentricity/inclination vectors with the secular model, but $\delta\lambda$ is the along-track phase coordinate most sensitive to where the deputy sits on the orbit at epoch.
+    \item A pure mean-to-mean $\delta\lambda_0$ can leave a $\mathcal{O}(10)$~km epoch mismatch in Hill frame while leaving secular rates correct.
+    \item $\delta\lambda$ is the \textbf{only} ROE component that can be adjusted without contradicting the mean-line values of $(a,e,i,\Omega,\omega)$ and the relative vector components. Changing $\delta e_x$, $\delta e_y$, or $\delta i_y$ to force Hill-frame coincidence at epoch would corrupt the mean-line relative geometry.
+\end{itemize}
+
+\textbf{Validation:} \texttt{sweep\_delta\_lambda.py} confirms that for CYG02/CYG07, the osculating $\delta\lambda_0$ is near-optimal for minimizing $|\Delta\mathbf{r}|$ RMS ($\sim 4.5$~km vs Orekit). For CYG04/CYG08, sweeping $\delta\lambda$ barely helps ($\sim 36$~km best), indicating larger model mismatch for that pair (different SMA, less favorable geometry).
+
+\subsection{Experiments explicitly \emph{not} adopted}
+
+\begin{description}
+    \item[Full osculating $\delta\bm{\alpha}_0$ (all six components).]
+    Rejected: does not fix cross-track bias and breaks consistency with mean-line propagation.
+
+    \item[Hill-matched IC (solve $\delta e_x$, $\delta\lambda$, $\delta i_y$ for epoch RTN match).]
+    Rejected: achieves epoch coincidence by shrinking cross-track oscillation amplitude---unphysical for the mean-element model. The optimizer would see the wrong formation geometry.
+
+    \item[Retune $\delta i_y$ for Hill coincidence.]
+    Rejected for the same reason: $\delta i_y$ is tied to mean differential RAAN; forcing it to match osculating cross-track at one instant corrupts the propagated relative inclination vector.
+
+    \item[Replace $u$ by $u-u_0$ inside \emph{all} mapping harmonics.]
+    Rejected after bug discovery (Section~\ref{sec:mapping}): rotates $(\delta e_x,\delta e_y)$ and $(\delta i_x,\delta i_y)$ without rotating the state, producing $\sim 100$+~km errors.
+\end{description}
+
+%=============================================================================
+\section{ROE-to-relative-position mapping}
+\label{sec:mapping}
+%=============================================================================
+
+\subsection{Frame}
+
+Validation plots use the chief \textbf{Hill / RTN} frame:
+\begin{itemize}
+    \item $\hat{\mathbf{r}}$ (radial): along chief position vector.
+    \item $\hat{\mathbf{t}}$ (along-track): approximately along velocity, completed to right-handed set.
+    \item $\hat{\mathbf{n}}$ (cross-track): along angular momentum ($\mathbf{r}\times\mathbf{v}$).
+\end{itemize}
+
+Plot labels follow $x = N$, $y = T$, $z = R$ with $R$ vertical in 3D figures; normal and tangential axes share equal kilometer scaling.
+
+The thesis chapter derives the first-order map from ROEs to relative position. For near-circular orbits, with chief semimajor axis $a_c$ and \textbf{absolute} argument of latitude $u = \omega + \nu$ in the harmonic terms:
+\begin{equation}
+\begin{bmatrix}
+\delta r_r \\ \delta r_t \\ \delta r_n
+\end{bmatrix}
+\approx a_c
+\begin{bmatrix}
+\delta a - \delta e_x \cos u - \delta e_y \sin u \\
+-\tfrac{3}{2}\delta a\,\Delta u + \delta\lambda + 2\delta e_x \sin u - 2\delta e_y \cos u \\
+\delta i_x \sin u - \delta i_y \cos u
+\end{bmatrix},
+\label{eq:map}
+\end{equation}
+where $\Delta u = u - u_0$ is elapsed argument of latitude since epoch and appears \textbf{only} in the secular along-track term.
+
+\subsection{Implementation (\texttt{\_roe\_to\_relpos\_first\_order})}
+
+\begin{enumerate}
+    \item Unwrap $u_k = \omega_k + \nu_k$ along the chief history.
+    \item $\Delta u_k = u_k - u_0$.
+    \item Evaluate \eqref{eq:map} at each sample with \textbf{full} $u_k$ inside $\sin u_k$ and $\cos u_k$.
+\end{enumerate}
+
+\subsection{The $u$ versus $\Delta u$ bug (fixed)}
+
+An earlier implementation used $u - u_0$ inside the trigonometric functions. That is equivalent to applying a time-varying rotation to the relative eccentricity and inclination vectors in the mapping without applying the same rotation to the propagated ROE components. Symptom: large artificial cross-track bias and phase error ($\sim 147$~km RMS for CYG02/CYG07).
+
+\textbf{Correct rule:}
+\begin{center}
+\fbox{\parbox{0.92\linewidth}{
+\textbf{Absolute} $u$ in all $\sin u$, $\cos u$ terms.\\
+\textbf{Elapsed} $\Delta u$ only in the $-\tfrac{3}{2}\delta a\,\Delta u$ secular along-track term.
+}}
+\end{center}
+
+After correction: CYG02/CYG07 ROE Hill-frame RMS $\approx 7.7$~km (epoch residual $\approx (0.6,-1.3,7.3)$~km in R,T,N).
+
+\subsection{Expected residual at $\sim 100$~km separation}
+
+Even with the correct map, $\mathcal{O}(1\text{--}10)$~km errors are expected because:
+\begin{itemize}
+    \item The map is first-order in $\delta\bm{\alpha}$ at finite separation.
+    \item ROE propagation omits short-period gravity and non-$J_2$ forces present in onboard data.
+    \item Mean vs.\ osculating mismatch remains in channels other than $\delta\lambda_0$.
+\end{itemize}
+
+Orekit (osculating ICs, full force models) achieves $\sim 1.5$~km RMS vs onboard for CYG02/CYG07, establishing the noise floor of the truth data and propagator fidelity.
+
+%=============================================================================
+\section{Orekit high-fidelity propagator}
+%=============================================================================
+
+\subsection{Role}
+
+Orekit answers validation questions the ROE model cannot:
+\begin{itemize}
+    \item Does the formation survive when $J_2$ short-period terms, tesseral harmonics, drag, SRP, and third-body gravity return?
+    \item Does propagated relative position match contemporaneous onboard ephemerides?
+\end{itemize}
+
+\subsection{Force models and why each is enabled}
+
+\begin{description}
+    \item[$20\times 20$ normalized gravity (Holmes--Featherstone on WGS84).]
+    Recovers short-period oscillations in $a$, $e$, $i$ visible in osculating histories. Necessary for apples-to-apples comparison with onboard elements.
+
+    \item[NRLMSISE-00 drag, $C_d \approx 2.2$, area $\sim 0.005$~m$^2$, mass $\sim 28$~kg.]
+    CYGNSS is not drag-free. Even at $\sim 500$~km, drag contributes to long-term $a$ decay. Omitting drag would accept formations that appear artificially stable in pure gravity.
+
+    \item[Isotropic SRP.]
+    Small but persistent non-gravitational acceleration with no ROE analogue; included for alignment with operational OD environments.
+
+    \item[Sun and Moon third-body point masses.]
+    Long-period effects on inclination and node; included so multi-day validation matches operations, not a toy $J_2$-only problem.
+\end{description}
+
+\subsection{Integrator and frames}
+
+\begin{itemize}
+    \item Dormand--Prince 8(5,3) Cowell integrator; tolerances $10^{-12}$~m, $10^{-12}$~m/s.
+    \item Force models evaluated in ITRF; state in EME2000; osculating COE reported in TEME (NORAD convention).
+    \item ICs: each spacecraft propagated from \textbf{osculating} $\mathbf{r},\mathbf{v}$ at epoch (from onboard ECEF transformed to inertial).
+\end{itemize}
+
+\textbf{Decision:} Orekit does \emph{not} use mean-line elements as ICs in validation. ROE uses mean-line + $\delta\lambda$ anchor. This mirrors the intended workflow split: mean secular theory vs.\ osculating truth propagation.
+
+\subsection{Mean-to-osculating bridge (deferred)}
+
+When only mean elements are available (no truth $\mathbf{r},\mathbf{v}$), three options were tabulated for future work:
+\begin{enumerate}
+    \item Analytic Kozai short-period forward correction (fast, first-order).
+    \item Orekit Brouwer--Lyddane / DSST mean-to-osculating (library-native).
+    \item Fixed-point iteration against this project's mean extractor (self-consistent).
+\end{enumerate}
+\textbf{Recommendation recorded:} option 2 + 3 for Orekit seeding; place deputy relative to chief osculating state plus differential correction for formation work.
+
+%=============================================================================
+\section{Validation methodology}
+%=============================================================================
+
+\subsection{Data source}
+
+CYGNSS L1 DDMI geolocation products provide ECEF position and velocity. Validation windows use matched 5-minute samples for chief and deputy.
+
+\subsection{Primary case: CYG02 (chief) / CYG07 (deputy)}
+
+Window: 2026-01-10 19:15:00--23:05:00 UTC ($\approx 3.8$~h, 47 samples).
+
+\textbf{Procedure:}
+\begin{enumerate}
+    \item Transform onboard $\mathbf{r},\mathbf{v}$ to ECI; form osculating TEME COE histories.
+    \item True relative RTN from $\mathbf{r}_d - \mathbf{r}_c$ projected onto chief basis.
+    \item Onboard ROE history with $u = \omega + \nu$.
+    \item Mean-line ICs (Section~\ref{sec:mapping}); $\delta\bm{\alpha}_0$ with $\delta\lambda_0$ anchor.
+    \item Integrate ROE EOMs; reconstruct deputy COEs; map to RTN via \eqref{eq:map}.
+    \item Propagate both spacecraft in Orekit from osculating ICs; form relative RTN from Cartesian states.
+    \item Compare classical elements and Hill trajectories.
+\end{enumerate}
+
+\subsection{Secondary case: CYG04 / CYG08}
+
+Window: 2026-02-12 05:00--11:10 UTC. Larger SMA mismatch between vehicles; ROE RMS $\sim 50$~km even after fixes. Used as a stress test, not the primary acceptance case.
+
+\subsection{Metrics reported}
+
+\begin{itemize}
+    \item Per-element time series (chief solid, deputy dashed; gray onboard, blue ROE mean-line, green Orekit).
+    \item Hill 3D trajectory and 2D projections (N--T equal scale; R exaggerated in 3D for readability).
+    \item $|\Delta\mathbf{r}|$ RMS vs onboard; epoch residual vector.
+\end{itemize}
+
+%=============================================================================
+\section{Interpreting CYG02/CYG07 results}
+%=============================================================================
+
+At epoch, true relative RTN $\approx (3.8,\,77,\,61)$~km (R,T,N), $|\mathbf{r}| \approx 98$~km.
+
+Over the window:
+\begin{itemize}
+    \item Along-track drift onboard $\approx -126$~km; ROE map $\approx -115$~km; good secular agreement.
+    \item Cross-track reverses sign; ROE recovers phase and amplitude after the $u$-fix.
+    \item Orekit vs onboard: RMS $\approx 1.5$~km.
+    \item ROE vs onboard: RMS $\approx 7.7$~km; $| \Delta\mathbf{r}|$ RMS $\approx 4.5$~km.
+\end{itemize}
+
+\textbf{Classical element plots:} Blue ROE traces sit on the mean line (flat $a$, $e$, $i$; linearly drifting $\Omega$, $\omega$, $M$). Gray onboard and green Orekit show short-period ripples. \textbf{This is correct behavior.} The check is differential rates and Hill geometry, not bitwise overlay of osculating and mean $a(t)$.
+
+\textbf{Division of labor confirmed:}
+\begin{itemize}
+    \item ROE + linear map: fast formation ranking and constraint evaluation in $\delta\bm{\alpha}$.
+    \item Orekit: feasibility and flight consistency for selected configurations.
+\end{itemize}
+
+%=============================================================================
+\section{Connection to the optimization cost function}
+%=============================================================================
+
+The scattering-plane metric (angle between relative position and the plane defined by chief, transmitter, and specular point) requires $\delta\mathbf{r}(t)$ in inertial space. The workflow:
+
+\begin{enumerate}
+    \item Propagate $\delta\bm{\alpha}(t)$ with \eqref{eq:roes} EOMs.
+    \item Map to $\delta\mathbf{r}_\mathrm{RTN}$ via \eqref{eq:map} (or higher-order map if implemented later).
+    \item Rotate RTN to inertial using chief attitude from secular or osculating chief state as appropriate.
+    \item Evaluate scattering angle and proximity constraints.
+\end{enumerate}
+
+\textbf{Design note (exploratory, not implemented):} Feasible sets in ROE space subject to scattering-plane constraints can be approximated as linear inequalities at a frozen epoch if the plane basis is fixed from chief + transmitter + specular geometry. Only $\delta\lambda$ remains as a mean-preserving degree of freedom for IC adjustment without distorting $(\delta e,\delta i)$ vectors.
+
+%=============================================================================
+\section{Constants and conventions}
+%=============================================================================
+
+\begin{center}
+\begin{tabular}{@{}ll@{}}
+\toprule
+Quantity & Value / convention \\
+\midrule
+$\mu_\oplus$ & WGS84 / IERS via \texttt{j2\_roe\_core.MU\_EARTH} \\
+$J_2$, $R_E$ & WGS84 \\
+Onboard COE frame & TEME osculating from $\mathbf{r},\mathbf{v}$ \\
+ROE propagation ICs & Mean-line + $\delta\lambda_0$ osculating anchor \\
+Orekit ICs & Osculating $\mathbf{r},\mathbf{v}$ at epoch \\
+Averaging window & 1.0 orbit forward from epoch \\
+Chief mean anomaly rate & Keplerian $\dot M = n$ (default) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+%=============================================================================
+\section{Summary of locked decisions}
+%=============================================================================
+
+\begin{enumerate}
+    \item Two-tier architecture: averaged $J_2$ ROEs (inner) + Orekit Cowell (outer).
+    \item No CW propagation; RTN frame for visualization only.
+    \item Quasi-nonsingular ROEs as the optimization state.
+    \item $\delta\dot\lambda$ excludes $(n_d-n_c)$; along-track Keplerian drift only in the position map via $\Delta u$.
+    \item Mean-line ICs: 1-orbit forward averaging + Kozai SMA inversion.
+    \item $\delta\lambda_0$ anchored to osculating onboard value; no Hill-matching of other ROEs.
+    \item Position map: absolute $u$ in harmonics, $\Delta u$ only in $-\tfrac{3}{2}\delta a\,\Delta u$.
+    \item Orekit: full force stack, osculating ICs, independent chief/deputy propagation.
+    \item CYG02/CYG07 as primary validation; CYG04/CYG08 as secondary stress case.
+\end{enumerate}
+
+These choices are implemented in the repository as of the validation runs documented in \texttt{ch-problem.tex} Section~``Relative Dynamics Validation'' and are not altered by this explanation document.
+
+%=============================================================================
+\section*{References}
+%=============================================================================
+\begin{itemize}
+    \item G.~Gaias et al., $J_2$ relative motion models (see \texttt{ch-problem.tex} bibliography).
+    \item S.~D'Amico, PhD thesis, relative orbital elements.
+    \item G.~Di Mauro, ROE formulations for formation flying.
+    \item Y.~Kozai, \emph{The motion of a close earth satellite}, AJ 64 (1959) --- Kozai short-period $a$ correction.
+    \item Orekit 13.x documentation --- Cowell propagator, force models.
+    \item Repository: \texttt{Documentation/ch-problem.tex}, \texttt{Optimizer/j2\_roe\_core.py}, \texttt{Optimizer/relative\_dynamics\_j2.py}, \texttt{Optimizer/Propagator Validation/}.
+\end{itemize}
+
+\end{document}
