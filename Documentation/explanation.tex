@@ -16,7 +16,7 @@ Detailed Explanation and Design Rationale}
 \maketitle
 
 \begin{abstract}
-This document is a standalone, implementation-level explanation of the dynamical models used in the CYGNSS formation-optimization workflow. It complements \texttt{ch-problem.tex} by recording \emph{why} each modeling choice was made, what alternatives were considered and rejected, and how the pieces fit together from onboard ephemerides through averaged relative orbital element (ROE) propagation to Orekit high-fidelity validation. Nothing here changes the production code or validation settings; it is documentation only.
+This document is a standalone, implementation-level explanation of the dynamical models used in the CYGNSS relative-formation workflow. It complements \texttt{ch-problem.tex} by recording \emph{why} each modeling choice was made, what alternatives were considered and rejected, and how the pieces fit together from onboard ephemerides through averaged relative orbital element (ROE) propagation to Orekit high-fidelity validation. Scope note: the long-term goal has shifted from selecting a single optimized orbit toward identifying a \emph{manifold} (feasible range) of relative orbital elements; the dynamical model documented here is unchanged by that framing.
 \end{abstract}
 
 \tableofcontents
@@ -138,7 +138,17 @@ with $Q = 5\cos^2 i - 1$, $P = 3\cos^2 i$, and $K = \tfrac{3}{4} n J_2 R_E^2 / (
 
 \subsection{Chief propagation}
 
-The chief advances in \textbf{mean} classical elements under the same $J_2$ secular model (\texttt{chief\_secular\_at\_time}). Mean anomaly uses Keplerian $\dot M = n$ unless a J2-modified rate mode is selected (default: \texttt{kepler}).
+The chief advances in \textbf{mean} classical elements under the same $J_2$ secular model (\texttt{chief\_secular\_at\_time}):
+\begin{itemize}
+    \item $\dot\omega$ and $\dot\Omega$ \textbf{always} include first-order $J_2$ secular rates, in every mode.
+    \item $\dot M$ is controlled by \texttt{chief\_mean\_anomaly\_rate}:
+    \begin{description}
+        \item[\texttt{j2\_averaged} (default).] $\dot M = n + \eta P K$, the same first-order $J_2$ contribution that appears in the classical Gauss-averaged $\dot M$ formula. This is the preferred production setting so chief and deputy share a consistent long-term $J_2$ secular mean-anomaly rate.
+        \item[\texttt{kepler}.] $\dot M = n = \sqrt{\mu/a^3}$ only. Kept for sensitivity checks; it does \emph{not} turn off $J_2$ on $\omega$ or $\Omega$, nor in the relative EOMs.
+    \end{description}
+\end{itemize}
+
+\textbf{Important clarification.} There is no mode that runs the chief as a pure two-body Keplerian orbit while the deputy feels $J_2$. Relative rates $\delta\dot\lambda$, $\delta\dot e_{x,y}$, and $\delta\dot i_y$ always use differential $J_2$ for both spacecraft. The switch only decides whether the \emph{absolute} chief mean anomaly carries the $J_2$ piece of $\dot M$. Over the CYG02/CYG07 $\approx 3.8$~h window the ROE state history is identical between modes (to machine precision); Hill-frame residuals differ by $\mathcal{O}(1)$~km only because the mapping argument of latitude $u=\omega+\nu$ advances slightly faster under \texttt{j2\_averaged}.
 
 \subsection{Deputy reconstruction}
 
@@ -202,6 +212,28 @@ g(\nu) =
 \label{eq:kozai}
 \end{equation}
 
+This is an algebraic relation between the \emph{instantaneous} osculating SMA and the underlying mean SMA at a given true anomaly. It is \textbf{not} a propagator; it is a snapshot conversion at one epoch.
+
+\subsubsection{Algebraic inversion (osculating $\to$ mean)}
+
+Given an estimate of the osculating SMA $a_\mathrm{osc}$ (typically the orbit-averaged $a$ samples, which still sit near the osculating envelope) together with $e$, $i$, $\omega$, and $\nu$ at epoch, rearrange \eqref{eq:kozai} as a quadratic in $\bar{a}$:
+\begin{equation}
+\bar{a}^2 - a_\mathrm{osc}\,\bar{a} + J_2 R_E^2\,g(\nu) = 0.
+\end{equation}
+The physical root (the one near $a_\mathrm{osc}$) is
+\begin{equation}
+\bar{a} = \tfrac{1}{2}\Bigl(a_\mathrm{osc} + \sqrt{a_\mathrm{osc}^2 - 4 J_2 R_E^2\,g(\nu)}\Bigr),
+\end{equation}
+which is exactly what \texttt{osculating\_kepler\_to\_mean\_line} returns. Mean anomaly follows from converting epoch $\nu$ to $M$ with the same $e$; averaged $e$, $i$, $\Omega$, and $\omega$ are retained without a short-period correction at this order.
+
+\subsubsection{Forward correction (mean $\to$ osculating)}
+
+The same formula run forward seeds an approximate osculating SMA from a known mean line:
+\begin{equation}
+a_\mathrm{osc}(\nu) = \bar{a} + \frac{J_2 R_E^2}{\bar{a}}\,g(\nu).
+\end{equation}
+Higher-order theories (Brouwer, Lyddane, DSST) also correct $e$, $i$, $\Omega$, $\omega$, and $M$ with short-period series; first-order Kozai on $a$ alone is a useful but incomplete step.
+
 \textbf{Decision:} After orbit-averaging osculating samples, solve \eqref{eq:kozai} for mean $\bar{a}$ at the epoch true anomaly (\texttt{osculating\_kepler\_to\_mean\_line}). Retain averaged $e$, $i$, $\Omega$, $\omega$; set $M$ from epoch $\nu$.
 
 \textbf{Rationale:}
@@ -212,6 +244,26 @@ g(\nu) =
 \end{itemize}
 
 \textbf{Relative drift preserved:} Both spacecraft receive identical treatment, so $\delta a$ from mean lines tracks the differential semimajor axis relevant to secular along-track drift even when absolute mean $a$ is offset from the osculating mean.
+
+\subsubsection{Can Orekit be initialized without onboard truth?}
+
+Yes. Orekit requires an \emph{osculating} Cartesian (or Keplerian) state at epoch, not a mean-line state. When flight $\mathbf{r},\mathbf{v}$ are unavailable, a suitable IC can be built from mean elements as follows.
+
+\begin{enumerate}[label=\textbf{\arabic*.}]
+    \item \textbf{Analytic first-order Kozai forward map.}
+    Start from mean $(\bar{a},\bar{e},\bar{i},\bar{\Omega},\bar{\omega},\bar{M})$. Choose an epoch true anomaly $\nu$ consistent with $\bar{M}$ (Kepler equation). Set
+    $a_\mathrm{osc} = \bar{a} + (J_2 R_E^2/\bar{a})\,g(\nu)$ and leave angles at their mean values (or apply simple Brouwer short-period corrections if coded). Convert $(a_\mathrm{osc},e,i,\Omega,\omega,\nu)$ to $\mathbf{r},\mathbf{v}$. This is fast and usually recovers the bulk of the $J_2$ short-period SMA ripple ($\mathcal{O}(1)$~km in LEO), but it does not restore tesseral, drag, or higher-zonal short-period content.
+
+    \item \textbf{Orekit mean $\to$ osculating (preferred library path).}
+    Use Orekit's Brouwer--Lyddane mean elements or a DSST mean orbit as the mean state, then convert to an osculating \texttt{KeplerianOrbit} / \texttt{CartesianOrbit} at the desired AbsoluteDate. This is consistent with Orekit's own force-model conventions and is the recommended first production choice when mean elements come from an external catalog or from the ROE manifold design.
+
+    \item \textbf{Fixed-point consistency with this repository's mean extractor.}
+    Guess an osculating state $\mathbf{x}_0$, propagate briefly (or sample one orbit) with Orekit, run the project's orbit-average + Kozai inverse extractor, and adjust $\mathbf{x}_0$ until the extracted mean matches the design mean. This closes the loop between ``our'' mean definition and Orekit's osculating ephemeris and is recommended as a refinement after (2).
+\end{enumerate}
+
+\textbf{Formation practice.} Prefer converting the \emph{chief} mean line to osculating $\mathbf{r}_c,\mathbf{v}_c$ by (2) or (2)+(3), then placing the deputy from the design $\delta\bm{\alpha}_0$ via the inverse ROE map to mean deputy elements, then converting the deputy the same way---or, equivalently, mapping $\delta\bm{\alpha}_0$ to a relative Cartesian offset at epoch and adding it to the chief osculating state with a small differential correction so the reconstructed ROEs match the design. Absolute phasing of $\delta\lambda_0$ remains a free design parameter when no truth ephemeris exists (see the discussion of $\delta\lambda$ as a degree of freedom in the agent response accompanying this document).
+
+\textbf{Accuracy expectation.} Without truth, Orekit ICs from mean$\to$osculating will not overlay flight L1 to meter level, but they are suitable for high-fidelity assessment of a candidate ROE manifold: short-period ripple, drag, and third-body effects are restored relative to the averaged design, which is the purpose of the outer loop.
 
 %=============================================================================
 \section{Mean-line initial condition extraction}
@@ -334,7 +386,7 @@ An earlier implementation used $u - u_0$ inside the trigonometric functions. Tha
 }}
 \end{center}
 
-After correction: CYG02/CYG07 ROE Hill-frame RMS $\approx 7.7$~km (epoch residual $\approx (0.6,-1.3,7.3)$~km in R,T,N).
+After correction (and with chief $\dot M$ in \texttt{j2\_averaged} mode): CYG02/CYG07 ROE Hill-frame RMS $\approx 7.1$~km (epoch residual $\approx (0.6,-1.3,7.3)$~km in R,T,N).
 
 \subsection{Expected residual at $\sim 100$~km separation}
 
@@ -385,15 +437,9 @@ Orekit answers validation questions the ROE model cannot:
 
 \textbf{Decision:} Orekit does \emph{not} use mean-line elements as ICs in validation. ROE uses mean-line + $\delta\lambda$ anchor. This mirrors the intended workflow split: mean secular theory vs.\ osculating truth propagation.
 
-\subsection{Mean-to-osculating bridge (deferred)}
+\subsection{Mean-to-osculating bridge (for production without truth)}
 
-When only mean elements are available (no truth $\mathbf{r},\mathbf{v}$), three options were tabulated for future work:
-\begin{enumerate}
-    \item Analytic Kozai short-period forward correction (fast, first-order).
-    \item Orekit Brouwer--Lyddane / DSST mean-to-osculating (library-native).
-    \item Fixed-point iteration against this project's mean extractor (self-consistent).
-\end{enumerate}
-\textbf{Recommendation recorded:} option 2 + 3 for Orekit seeding; place deputy relative to chief osculating state plus differential correction for formation work.
+When only mean elements are available (no onboard $\mathbf{r},\mathbf{v}$), Orekit still needs an osculating IC. The three practical bridges are detailed under the Kozai section above: (1)~analytic Kozai forward SMA correction, (2)~Orekit Brouwer--Lyddane / DSST mean$\to$osculating, and (3)~fixed-point iteration against this project's mean extractor. \textbf{Recommended:} (2) for a first seed, optionally refined by (3); place the deputy relative to the chief osculating state so the design $\delta\bm{\alpha}_0$ is preserved.
 
 %=============================================================================
 \section{Validation methodology}
@@ -441,7 +487,7 @@ Over the window:
     \item Along-track drift onboard $\approx -126$~km; ROE map $\approx -115$~km; good secular agreement.
     \item Cross-track reverses sign; ROE recovers phase and amplitude after the $u$-fix.
     \item Orekit vs onboard: RMS $\approx 1.5$~km.
-    \item ROE vs onboard: RMS $\approx 7.7$~km; $| \Delta\mathbf{r}|$ RMS $\approx 4.5$~km.
+    \item ROE vs onboard: RMS $\approx 7.1$~km; $| \Delta\mathbf{r}|$ RMS $\approx 3.9$~km (\texttt{j2\_averaged} chief $\dot M$).
 \end{itemize}
 
 \textbf{Classical element plots:} Blue ROE traces sit on the mean line (flat $a$, $e$, $i$; linearly drifting $\Omega$, $\omega$, $M$). Gray onboard and green Orekit show short-period ripples. \textbf{This is correct behavior.} The check is differential rates and Hill geometry, not bitwise overlay of osculating and mean $a(t)$.
@@ -481,8 +527,8 @@ $J_2$, $R_E$ & WGS84 \\
 Onboard COE frame & TEME osculating from $\mathbf{r},\mathbf{v}$ \\
 ROE propagation ICs & Mean-line + $\delta\lambda_0$ osculating anchor \\
 Orekit ICs & Osculating $\mathbf{r},\mathbf{v}$ at epoch \\
+Chief mean anomaly rate & \texttt{j2\_averaged} ($n+\eta P K$; default) \\
 Averaging window & 1.0 orbit forward from epoch \\
-Chief mean anomaly rate & Keplerian $\dot M = n$ (default) \\
 \bottomrule
 \end{tabular}
 \end{center}
@@ -492,14 +538,15 @@ Chief mean anomaly rate & Keplerian $\dot M = n$ (default) \\
 %=============================================================================
 
 \begin{enumerate}
-    \item Two-tier architecture: averaged $J_2$ ROEs (inner) + Orekit Cowell (outer).
+    \item Two-tier architecture: averaged $J_2$ ROEs (inner / manifold evaluation) + Orekit Cowell (outer).
     \item No CW propagation; RTN frame for visualization only.
-    \item Quasi-nonsingular ROEs as the optimization state.
+    \item Quasi-nonsingular ROEs as the design state (feasible range / manifold, not a single optimum).
     \item $\delta\dot\lambda$ excludes $(n_d-n_c)$; along-track Keplerian drift only in the position map via $\Delta u$.
+    \item Chief $\dot\omega$, $\dot\Omega$ always $J_2$; chief $\dot M$ defaults to \texttt{j2\_averaged} ($n+\eta PK$).
     \item Mean-line ICs: 1-orbit forward averaging + Kozai SMA inversion.
-    \item $\delta\lambda_0$ anchored to osculating onboard value; no Hill-matching of other ROEs.
+    \item $\delta\lambda_0$ anchored to osculating onboard value in validation only; in production without truth it is a free design degree of freedom.
     \item Position map: absolute $u$ in harmonics, $\Delta u$ only in $-\tfrac{3}{2}\delta a\,\Delta u$.
-    \item Orekit: full force stack, osculating ICs, independent chief/deputy propagation.
+    \item Orekit: full force stack; osculating ICs from truth when available, else mean$\to$osculating bridge.
     \item CYG02/CYG07 as primary validation; CYG04/CYG08 as secondary stress case.
 \end{enumerate}
 
